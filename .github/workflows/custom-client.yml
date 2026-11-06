@@ -1,0 +1,150 @@
+# Installed into our fork of rustdesk/rustdesk as .github/workflows/custom-client.yml
+#
+# Produces one custom client build. Started by the management server through
+# workflow_dispatch. The server has already:
+#   1. created a DRAFT release (drafts are visible only to repo collaborators),
+#   2. uploaded bundle.zip to it (signed custom.txt, icons, logos, manifest.json).
+# This workflow repackages the base packages from `base_tag` with that bundle and
+# uploads the results back to the same draft release, where the server collects them.
+#
+# Keep logs free of config contents: the fork is public, so run logs are too.
+
+name: Custom client
+
+run-name: "custom-client ${{ inputs.build_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Build id assigned by the management server"
+        required: true
+        type: string
+      release_id:
+        description: "Numeric id of the draft release holding bundle.zip"
+        required: true
+        type: string
+      base_tag:
+        description: "Release tag with the base packages, e.g. base-1.5.1"
+        required: true
+        type: string
+      targets:
+        description: 'JSON array, e.g. ["windows-x86_64","macos-aarch64","linux-x86_64"]'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: "1.75"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        env:
+          TARGETS: ${{ inputs.targets }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c '{include: map({target: ., os: ({
+              "windows-x86_64": "windows-2022",
+              "windows-aarch64": "windows-11-arm",
+              "macos-x86_64": "macos-15-intel",
+              "macos-aarch64": "macos-15",
+              "linux-x86_64": "ubuntu-24.04",
+              "linux-aarch64": "ubuntu-24.04-arm"
+            }[.] // error("unknown target: " + .))})}' <<<"$TARGETS")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  customize:
+    needs: prepare
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET: ${{ matrix.target }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      BASE_TAG: ${{ inputs.base_tag }}
+      TOOLS: tools/.github/custom-client
+    steps:
+      # Scripts come from the branch this workflow runs on, so they can be fixed
+      # without producing a new base build.
+      - name: Checkout packaging scripts
+        uses: actions/checkout@v4
+        with:
+          path: tools
+          sparse-checkout: .github/custom-client
+          persist-credentials: false
+
+      # Source at the base tag: Windows needs res/msi and libs/portable from the
+      # exact commit the base packages were built from.
+      - name: Checkout source at base tag
+        if: startsWith(matrix.target, 'windows')
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_tag }}
+          path: src
+          persist-credentials: false
+
+      - name: Fetch base package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cc/base
+          gh release download "$BASE_TAG" --repo "$GITHUB_REPOSITORY" -p "base-${TARGET}.*" -D cc/base
+          ls -l cc/base
+
+      - name: Fetch bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$TOOLS/release-asset.sh" download "$RELEASE_ID" bundle.zip cc/bundle.zip
+          mkdir -p cc/bundle
+          (cd cc/bundle && unzip -q ../bundle.zip)
+
+      # ---------- Windows ----------
+      - name: Set up Rust (Windows packer)
+        if: startsWith(matrix.target, 'windows')
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Add MSBuild to PATH
+        if: startsWith(matrix.target, 'windows')
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: ${{ matrix.target == 'windows-aarch64' && 'arm64' || 'x86' }}
+
+      - name: Customize (Windows)
+        if: startsWith(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          & "$env:TOOLS/customize-windows.ps1" -Target $env:TARGET -Bundle cc/bundle -BaseZip "cc/base/base-$env:TARGET.zip" -Source src -Out cc/out
+
+      # ---------- macOS ----------
+      - name: Customize (macOS)
+        if: startsWith(matrix.target, 'macos')
+        shell: bash
+        run: bash "$TOOLS/customize-macos.sh" "$TARGET" cc/bundle "cc/base/base-$TARGET.dmg" cc/out
+
+      # ---------- Linux ----------
+      - name: Customize (Linux)
+        if: startsWith(matrix.target, 'linux')
+        shell: bash
+        run: bash "$TOOLS/customize-linux.sh" "$TARGET" cc/bundle "cc/base/base-$TARGET.deb" cc/out
+
+      - name: Upload results to draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in cc/out/*; do
+            bash "$TOOLS/release-asset.sh" upload "$RELEASE_ID" "$f"
+          done

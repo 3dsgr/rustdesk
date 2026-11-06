@@ -1,0 +1,93 @@
+# Installed into our fork of rustdesk/rustdesk as .github/workflows/base-build.yml
+#
+# Builds the stock client once per upstream release (with OUR config-signing public
+# key compiled in) and publishes the unpacked, unbranded packages to a public GitHub
+# release named after `base_tag`. Every custom client is later produced from these
+# packages by custom-client.yml in a few minutes, without recompiling the client.
+#
+# The release doubles as the AGPL-3.0 source offer: the tag points at the exact
+# commit (upstream + our key patch) the binaries were built from.
+
+name: Base build for custom clients
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Release tag for the base packages, e.g. base-1.5.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ${{ inputs.base_tag }}
+
+  publish-base:
+    needs: build
+    # Some upstream jobs (iOS, Android signing, flatpak) may fail without upstream's
+    # secrets. We only need Windows, macOS and Linux, so collect whatever exists and
+    # fail below if one of the required packages is missing.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts
+          pattern: rustdesk-unsigned-windows-*
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts
+          pattern: rustdesk-unsigned-macos-*
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts
+          pattern: rustdesk-*.deb
+
+      - name: Assemble base packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p base
+          for arch in x86_64 aarch64; do
+            win="artifacts/rustdesk-unsigned-windows-${arch}"
+            if [ -d "$win" ]; then
+              (cd "$win" && zip -qr "../../base/base-windows-${arch}.zip" .)
+            fi
+            dmg=$(find "artifacts/rustdesk-unsigned-macos-${arch}" -type f -name '*.dmg' 2>/dev/null | head -n1 || true)
+            if [ -n "$dmg" ]; then cp "$dmg" "base/base-macos-${arch}.dmg"; fi
+            deb=$(find artifacts -type f -path "*-${arch}.deb/*" -name '*.deb' 2>/dev/null | head -n1 || true)
+            if [ -n "$deb" ]; then cp "$deb" "base/base-linux-${arch}.deb"; fi
+          done
+          ls -l base
+          for required in base-windows-x86_64.zip base-macos-x86_64.dmg base-macos-aarch64.dmg base-linux-x86_64.deb; do
+            test -f "base/$required" || { echo "missing $required"; exit 1; }
+          done
+
+      - name: Publish base packages to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.base_tag }}"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$tag" --notes "Base packages for custom clients. Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}"
+          fi
+          gh release upload "$tag" base/* --repo "$GITHUB_REPOSITORY" --clobber
