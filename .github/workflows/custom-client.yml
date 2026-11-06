@@ -92,6 +92,9 @@ jobs:
         with:
           ref: ${{ inputs.base_tag }}
           path: src
+          # libs/portable is a member of the root cargo workspace, which needs
+          # every member (incl. the libs/hbb_common submodule) to resolve.
+          submodules: recursive
           persist-credentials: false
 
       - name: Fetch base package
