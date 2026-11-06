@@ -51,11 +51,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # macOS repackaging (hdiutil, iconutil, PlistBuddy, ad-hoc codesign) does
+          # not depend on the host CPU, so both macOS targets use the Intel pool:
+          # arm64 "macos-15" jobs sat queued >15 min and were cancelled (2026-11-06).
           matrix=$(jq -c '{include: map({target: ., os: ({
               "windows-x86_64": "windows-2022",
               "windows-aarch64": "windows-11-arm",
               "macos-x86_64": "macos-15-intel",
-              "macos-aarch64": "macos-15",
+              "macos-aarch64": "macos-15-intel",
               "linux-x86_64": "ubuntu-24.04",
               "linux-aarch64": "ubuntu-24.04-arm"
             }[.] // error("unknown target: " + .))})}' <<<"$TARGETS")
